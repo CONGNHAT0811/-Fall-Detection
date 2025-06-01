@@ -1,9 +1,0 @@
-Các file huấn luyện mô hình phát hiện người ngã
-
-1. image_labels.csv - File gán nhãn 0 - 1 của ảnh 
-2. fall_model.cc - Mô hình dùng để nhúng vào code camera
-3. fall_model.h5 - Mô hình ban đầu được lưu
-4. fall_model.tflite - Mô hình được chuyển sang dạng này để convert thành file .cc
-5. Train_Model - Mô hình được huấn luyện ở file này
-6. Xu_Ly_Ảnh - Các bước xử lý ảnh trước khi đưa vào mô hình huấn luyện
-7. Kiem_Tra_Du_Liệu - Kiểm tra dữ liệu ảnh và dữ liệu file image_labels.csv 

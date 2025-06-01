@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>{% block title %}Hệ thống giám sát người ngã{% endblock %}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/home.css') }}">
+</head>
+
+<body class="bg-gray-50 font-sans antialiased min-h-screen flex flex-col">
+    <header
+        class="w-full bg-gradient-to-r from-blue-600 to-blue-800 shadow-lg p-4 flex justify-between items-center text-white">
+        <h1 class="text-2xl md:text-3xl font-bold flex items-center gap-2">
+            <span>🛡️</span> Hệ thống giám sát người ngã
+        </h1>
+        <div class="text-sm md:text-base flex items-center gap-2">
+            <span class="hidden sm:inline">Xin chào</span> 
+        </div>
+    </header>
+    <div class="flex flex-1 h-[calc(100vh-72px)] flex-col md:flex-row">
+        <aside class="w-full md:w-64 bg-white shadow-md p-4 flex flex-col border-b md:border-b-0 md:border-r">
+            <nav class="flex flex-col gap-4 mt-4">
+                <a href="/camera" id="cameraLink"
+                    class="nav-link text-gray-700 hover:text-blue-600 font-medium flex items-center gap-2 py-2 px-3 rounded hover:bg-blue-50">
+                    <span>🎥</span> Camera
+                </a>
+                <a href="/messenger" id="messengerLink"
+                    class="nav-link text-gray-700 hover:text-blue-600 font-medium flex items-center gap-2 py-2 px-3 rounded hover:bg-blue-50">
+                    <span>🔔</span> Thông báo
+                </a>
+                <a href="/history" id="historyLink"
+                    class="nav-link text-gray-700 hover:text-blue-600 font-medium flex items-center gap-2 py-2 px-3 rounded hover:bg-blue-50">
+                    <span>📜</span> Lịch sử
+                </a>
+            </nav>
+        </aside>
+        <div class="flex-1">
+            {% block cont %}{% endblock %}
+        </div>
+    </div>
+</body>
+
+</html>

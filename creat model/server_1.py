@@ -7,7 +7,7 @@ app = Flask(__name__)
 
 # Load mô hình phát hiện ngã
 print("[INFO] Loading fall_detection TFLite model...")
-interpreter = tf.lite.Interpreter(model_path="E:/NCKH/fall_model_int8.tflite")
+interpreter = tf.lite.Interpreter(model_path="fall_model_int8.tflite")
 interpreter.allocate_tensors()
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()

@@ -1,0 +1,84 @@
+{% extends "main.html" %}
+{% block title %}Lịch sử phát hiện{% endblock %}
+{% block cont %}
+<main class="flex-1 p-4 md:p-6 overflow-y-auto scrollbar-custom">
+    <div class="content-section">
+        <h2 class="text-2xl font-semibold mb-4 text-gray-800 flex items-center gap-2">
+            <span>📜</span> Lịch sử phát hiện
+        </h2>
+        <input type="text" id="searchInput" placeholder="Tìm kiếm..." class="p-2 border rounded w-full mb-4" />
+        <div id="loading" class="text-center text-gray-600">Đang tải...</div>
+        <ul id="historyList" class="space-y-4 hidden"></ul>
+    </div>
+</main>
+<script>
+    async function loadHistory() {
+        const list = document.getElementById('historyList');
+        const loading = document.getElementById('loading');
+        try {
+            const res = await fetch('/api/history');
+            if (!res.ok) throw new Error('Lỗi khi lấy dữ liệu: ' + res.status);
+            const data = await res.json();
+            if (data.error) throw new Error(data.error);
+            loading.classList.add('hidden');
+            list.classList.remove('hidden');
+            displayHistory(data);
+        } catch (error) {
+            console.error('Lỗi:', error);
+            list.innerHTML = '<li class="bg-red-50 p-4 rounded-lg shadow text-red-600">Lỗi: Không thể tải lịch sử</li>';
+            loading.classList.add('hidden');
+            list.classList.remove('hidden');
+        }
+    }
+
+    function displayHistory(data) {
+        const list = document.getElementById('historyList');
+        list.innerHTML = '';
+        if (data.length === 0) {
+            list.innerHTML = '<li class="bg-gray-50 p-4 rounded-lg shadow text-gray-600">Không có dữ liệu</li>';
+            return;
+        }
+        data.forEach(entry => {
+            const li = document.createElement('li');
+            li.className = 'bg-white p-4 rounded-lg shadow';
+            li.innerHTML = `
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                        <p><strong>🕒 Thời gian:</strong> ${entry.timestamp || 'Chưa có'}</p>
+                        <p><strong>📍 Vị trí:</strong> ${entry.location || 'Chưa có'}</p>
+                        <p><strong>⚠️ Trạng thái:</strong> ${entry.status || 'Chưa có'}</p>
+                        <p><strong>📊 Xác suất:</strong> ${entry.probability || '0%'}</p>
+                    </div>
+                    <div>
+                        <img src="${entry.image_path || 'https://via.placeholder.com/320x180?text=Chua+Co+Anh'}" 
+                             class="rounded-lg border shadow w-full max-w-xs h-auto object-cover" 
+                             alt="Hình ảnh phát hiện" 
+                             onerror="this.src='https://via.placeholder.com/320x180?text=Anh+Bi+Loi';" />
+                    </div>
+                </div>
+            `;
+            list.appendChild(li);
+        });
+    }
+
+    document.getElementById('searchInput').addEventListener('input', async (e) => {
+        try {
+            const res = await fetch('/api/history');
+            if (!res.ok) throw new Error('Lỗi khi lấy dữ liệu: ' + res.status);
+            const data = await res.json();
+            if (data.error) throw new Error(data.error);
+            const keyword = e.target.value.toLowerCase();
+            const filtered = data.filter(entry =>
+                (entry.timestamp || '').toLowerCase().includes(keyword) ||
+                (entry.location || '').toLowerCase().includes(keyword) ||
+                (entry.status || '').toLowerCase().includes(keyword)
+            );
+            displayHistory(filtered);
+        } catch (error) {
+            console.error('Lỗi:', error);
+        }
+    });
+
+    loadHistory();
+</script>
+{% endblock %}

@@ -1,0 +1,94 @@
+{% extends "main.html" %}
+{% block title %}Thông Báo{% endblock %}
+{% block cont %}
+<main class="flex-1 p-4 md:p-6 overflow-y-auto scrollbar-custom">
+    <div id="notifySection" class="content-section">
+        <h2 class="text-2xl font-semibold mb-4 text-gray-800 flex items-center gap-2">
+            <span>🔔</span> Thông tin thông báo
+        </h2>
+        {% if error %}
+        <div class="error-message bg-red-50 p-4 rounded-lg shadow text-red-600 mb-4">{{ error }}</div>
+        {% endif %}
+        <div class="bg-white rounded-xl shadow-md p-6 notify-container">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div class="space-y-4">
+                    <div class="info-item">
+                        <p class="text-sm font-semibold text-gray-700">⚠️ Trạng Thái</p>
+                        <p id="status" class="text-base text-red-600 bg-red-50 p-2 rounded-lg">Chưa có phát hiện</p>
+                    </div>
+                    <div class="info-item">
+                        <p class="text-sm font-semibold text-gray-700">📊 Tỉ Lệ</p>
+                        <p id="probability" class="text-base text-blue-600 bg-blue-50 p-2 rounded-lg">0%</p>
+                    </div>
+                    <div class="info-item">
+                        <p class="text-sm font-semibold text-gray-700">🕒 Thời Gian</p>
+                        <p id="timestamp" class="text-base bg-gray-100 p-2 rounded-lg">Chưa có</p>
+                    </div>
+                    <div class="info-item">
+                        <p class="text-sm font-semibold text-gray-700">📍 Vị trí</p>
+                        <p id="locationElement" class="text-base bg-gray-100 p-2 rounded-lg">Chưa có</p>
+                    </div>
+                </div>
+                <div class="info-item">
+                    <p class="text-sm font-semibold text-gray-700">📸 Hình Ảnh</p>
+                    <img id="detectionImage" src="https://via.placeholder.com/320x180?text=Chua+Co+Anh"
+                        class="rounded-lg border shadow w-full h-auto" />
+                </div>
+            </div>
+        </div>
+    </div>
+</main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
+<script>
+    // Gửi yêu cầu chuyển sang chế độ detection
+    fetch('/api/set_mode', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: 'mode=detection'
+    })
+        .then(response => response.json())
+        .then(data => {
+            if (data.status === 'success') {
+                console.log('ESP32 set to detection mode');
+            } else {
+                console.error('Failed to set detection mode:', data.error);
+                alert('Lỗi: ' + data.message);
+            }
+        })
+        .catch(error => {
+            console.error('Error setting detection mode:', error);
+            alert('Lỗi: Không thể kết nối với ESP32');
+        });
+
+    // SocketIO cho cập nhật real-time
+    const socket = io('http://' + window.location.host);
+    socket.on('new_detection', (data) => {
+        try {
+            document.getElementById('status').textContent = data.status || 'Chưa có phát hiện';
+            document.getElementById('probability').textContent = data.probability || '0%';
+            document.getElementById('timestamp').textContent = data.timestamp || 'Chưa có';
+            document.getElementById('locationElement').textContent = data.location || 'Chưa có';
+            document.getElementById('detectionImage').src = data.image_path || 'https://via.placeholder.com/320x180?text=Chua+Co+Anh';
+            if (data.status === 'Ngã') {
+                fetch('/static/audio/alert.mp3')
+                    .then(response => {
+                        if (response.ok) {
+                            new Audio('/static/audio/alert.mp3').play();
+                        } else {
+                            console.warn('Alert audio not found');
+                        }
+                    })
+                    .catch(error => console.error('Error playing audio:', error));
+                alert(`Cảnh báo: Phát hiện ngã tại ${data.location} (${data.timestamp})!`);
+            }
+        } catch (error) {
+            console.error('Lỗi SocketIO:', error);
+        }
+    });
+    socket.on('connect_error', () => {
+        document.getElementById('status').textContent = 'Lỗi: Mất kết nối server';
+    });
+</script>
+{% endblock %}

@@ -1,0 +1,65 @@
+{% extends "main.html" %}
+{% block title %}Camera Trực Tiếp{% endblock %}
+{% block cont %}
+<main class="flex-1 p-4 md:p-6 overflow-y-auto scrollbar-custom">
+    <div id="cameraSection" class="content-section">
+        <h2 class="text-2xl font-semibold mb-4 text-gray-800 flex items-center gap-2">
+            <span>🎥</span> Camera trực tiếp
+        </h2>
+        <div class="camera-container bg-white rounded-xl shadow-md p-4">
+            <div class="aspect-video rounded-lg overflow-hidden border border-gray-200">
+                <img id="streamImage" src="/stream" alt="Live Camera" class="w-full h-full object-cover"
+                    onerror="this.src='https://via.placeholder.com/320x180?text=Khong+The+Tai+Camera'; this.alt='Lỗi camera'" />
+            </div>
+            <p id="streamStatus" class="text-sm text-gray-600 mt-2">Đang kết nối camera...</p>
+            <button id="reconnectBtn" class="mt-2 bg-blue-500 text-white px-4 py-2 rounded hidden"
+                onclick="reconnectStream()">Thử lại</button>
+        </div>
+    </div>
+</main>
+<script>
+    // Gửi yêu cầu chuyển sang chế độ stream khi tải trang
+    fetch('/api/set_mode', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: 'mode=stream'
+    })
+        .then(response => response.json())
+        .then(data => {
+            if (data.status === 'success') {
+                console.log('ESP32 set to stream mode');
+            } else {
+                console.error('Failed to set stream mode:', data.error);
+            }
+        })
+        .catch(error => console.error('Error setting stream mode:', error));
+
+    const streamImage = document.getElementById('streamImage');
+    const streamStatus = document.getElementById('streamStatus');
+    const reconnectBtn = document.getElementById('reconnectBtn');
+
+    function reconnectStream() {
+        streamStatus.textContent = 'Đang thử lại...';
+        streamStatus.classList.remove('text-green-600', 'text-red-600');
+        streamStatus.classList.add('text-gray-600');
+        reconnectBtn.classList.add('hidden');
+        streamImage.src = '/stream?' + new Date().getTime(); // Tải lại stream
+    }
+
+    streamImage.onload = () => {
+        streamStatus.textContent = 'Camera đang hoạt động';
+        streamStatus.classList.remove('text-red-600', 'text-gray-600');
+        streamStatus.classList.add('text-green-600');
+        reconnectBtn.classList.add('hidden');
+    };
+
+    streamImage.onerror = () => {
+        streamStatus.textContent = 'Lỗi: Không thể kết nối camera';
+        streamStatus.classList.remove('text-green-600', 'text-gray-600');
+        streamStatus.classList.add('text-red-600');
+        reconnectBtn.classList.remove('hidden');
+    };
+</script>
+{% endblock %}
