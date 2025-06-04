@@ -9,6 +9,12 @@
         {% if error %}
         <div class="error-message bg-red-50 p-4 rounded-lg shadow text-red-600 mb-4">{{ error }}</div>
         {% endif %}
+        <div id="deviceStatus" class="bg-yellow-50 p-4 rounded-lg shadow text-yellow-600 mb-4 hidden">
+            Thiết bị ESP32 đang offline. Vui lòng kiểm tra kết nối.
+        </div>
+        <div id="modeMessage" class="bg-blue-50 p-4 rounded-lg shadow text-blue-600 mb-4">
+            Bạn đang ở chế độ <strong>detection</strong>. Nhấn vào "Camera" để chuyển sang chế độ stream.
+        </div>
         <div class="bg-white rounded-xl shadow-md p-6 notify-container">
             <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
                 <div class="space-y-4">
@@ -37,30 +43,75 @@
             </div>
         </div>
     </div>
+    <div id="loadingSpinner" class="fixed inset-0 flex items-center justify-center bg-gray-800 bg-opacity-50 hidden">
+        <div class="text-white text-lg">Đang tải...</div>
+    </div>
 </main>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js" async></script>
 <script>
-    // Gửi yêu cầu chuyển sang chế độ detection
-    fetch('/api/set_mode', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body: 'mode=detection'
-    })
-        .then(response => response.json())
-        .then(data => {
+    const modeMessage = document.getElementById('modeMessage');
+    const deviceStatus = document.getElementById('deviceStatus');
+    const loadingSpinner = document.getElementById('loadingSpinner');
+
+    function showSpinner() {
+        loadingSpinner.classList.remove('hidden');
+    }
+
+    function hideSpinner() {
+        loadingSpinner.classList.add('hidden');
+    }
+
+    async function setDetectionMode() {
+        showSpinner();
+        try {
+            const response = await fetch('/api/set_mode', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: 'mode=detection'
+            });
+            const data = await response.json();
             if (data.status === 'success') {
                 console.log('ESP32 set to detection mode');
+                modeMessage.textContent = 'Bạn đang ở chế độ detection. Nhấn vào "Camera" để chuyển sang chế độ stream.';
+                modeMessage.classList.remove('text-red-600', 'bg-red-50');
+                modeMessage.classList.add('text-blue-600', 'bg-blue-50');
+                deviceStatus.classList.add('hidden');
             } else {
-                console.error('Failed to set detection mode:', data.error);
-                alert('Lỗi: ' + data.message);
+                console.error('Failed to set detection mode:', data.message);
+                modeMessage.textContent = 'Lỗi: ' + data.message;
+                modeMessage.classList.remove('text-blue-600', 'bg-blue-50');
+                modeMessage.classList.add('text-red-600', 'bg-red-50');
+                deviceStatus.classList.remove('hidden');
             }
-        })
-        .catch(error => {
+        } catch (error) {
             console.error('Error setting detection mode:', error);
-            alert('Lỗi: Không thể kết nối với ESP32');
-        });
+            modeMessage.textContent = 'Lỗi: Không thể kết nối với ESP32';
+            modeMessage.classList.remove('text-blue-600', 'bg-blue-50');
+            modeMessage.classList.add('text-red-600', 'bg-red-50');
+            deviceStatus.classList.remove('hidden');
+        } finally {
+            hideSpinner();
+        }
+    }
+
+    // Kiểm tra trạng thái thiết bị định kỳ
+    function checkDeviceStatus() {
+        fetch('/api/ping_esp32')
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'offline') {
+                    deviceStatus.classList.remove('hidden');
+                } else {
+                    deviceStatus.classList.add('hidden');
+                }
+            })
+            .catch(error => {
+                console.error('Error checking device status:', error);
+                deviceStatus.classList.remove('hidden');
+            });
+    }
+    setInterval(checkDeviceStatus, 5000); // Kiểm tra mỗi 5 giây
+    checkDeviceStatus();
 
     // SocketIO cho cập nhật real-time
     const socket = io('http://' + window.location.host);
@@ -85,10 +136,15 @@
             }
         } catch (error) {
             console.error('Lỗi SocketIO:', error);
+            deviceStatus.classList.remove('hidden');
         }
     });
     socket.on('connect_error', () => {
         document.getElementById('status').textContent = 'Lỗi: Mất kết nối server';
+        deviceStatus.classList.remove('hidden');
     });
+
+    // Gọi khi tải trang
+    setDetectionMode();
 </script>
 {% endblock %}

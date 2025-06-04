@@ -1,12 +1,8 @@
-
 from flask import Flask, render_template, request, jsonify, Response, send_from_directory
 from flask_socketio import SocketIO
 from datetime import datetime
 import numpy as np
-try:
-    from ai_edge_litert import lite_rt as tflite  # Use LiteRT
-except ImportError:
-    import tensorflow.lite as tflite  # Fallback
+import tensorflow.lite as tflite
 from PIL import Image
 import os
 import json
@@ -17,8 +13,10 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import time
 from bson import ObjectId
-import zeroconf
-import socket
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
 class JSONEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -30,135 +28,127 @@ app = Flask(__name__, static_folder='static', template_folder='templates')
 app.json_encoder = JSONEncoder
 socketio = SocketIO(app)
 
-# Cấu hình
+# Configuration
 UPLOAD_FOLDER = 'static/uploads'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 API_KEY = "08112003"
-ESP32_CURRENT_IP = "192.168.1.8"  # IP mặc định của ESP32
 MAX_STREAM_CLIENTS = 2
 active_streams = 0
 if not os.path.exists(UPLOAD_FOLDER):
     os.makedirs(UPLOAD_FOLDER)
 
-# Kết nối MongoDB
+# MongoDB connection
 try:
     client = MongoClient('mongodb://localhost:27017', serverSelectionTimeoutMS=5000)
     client.server_info()
     db = client['fall_detection']
     history_collection = db['history']
     devices_collection = db['devices']
-    print("[INFO] Kết nối MongoDB thành công.")
+    logging.info("MongoDB connected successfully.")
 except ConnectionFailure as e:
-    print(f"[ERROR] Không thể kết nối MongoDB: {e}")
+    logging.error(f"Failed to connect to MongoDB: {e}")
     raise
 
-# Load mô hình TFLite
+# Load TFLite model
 try:
-    print("[INFO] Loading fall_detection TFLite model...")
+    logging.info("Loading fall_detection TFLite model...")
     interpreter = tflite.Interpreter(model_path="fall_model_int8.tflite")
     interpreter.allocate_tensors()
     input_details = interpreter.get_input_details()
     output_details = interpreter.get_output_details()
-    print("[INFO] Model loaded successfully.")
+    logging.info("Model loaded successfully.")
 except Exception as e:
-    print(f"[ERROR] Failed to load TFLite model: {e}")
+    logging.error(f"Failed to load TFLite model: {e}")
     raise
 
-# Hàm lấy địa chỉ IP của máy chủ
-def get_local_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        # Kết nối đến một địa chỉ bất kỳ (không cần gửi dữ liệu)
-        s.connect(('8.8.8.8', 80))
-        ip = s.getsockname()[0]
-    except Exception as e:
-        print(f"[ERROR] Không thể lấy địa chỉ IP: {e}")
-        ip = '127.0.0.1'  # Fallback về localhost
-    finally:
-        s.close()
-    return ip
-
-# Khởi động mDNS server
-zeroconf_instance = zeroconf.Zeroconf()
-local_ip = get_local_ip()
-print(f"[INFO] Địa chỉ IP của máy chủ: {local_ip}")
-zeroconf_service = zeroconf.ServiceInfo(
-    "_http._tcp.local.",
-    "flask-server._http._tcp.local.",
-    addresses=[socket.inet_aton(local_ip)],  # Chuyển IP thành dạng binary
-    port=5000,
-    properties={}
-)
-zeroconf_instance.register_service(zeroconf_service)
-
-# Hàm gửi yêu cầu với cơ chế thử lại
-def send_request_to_esp32(url, data, retries=5, backoff_factor=2, timeout=15):
+# Send request with retry
+def send_request_to_esp32(url, data, retries=15, backoff_factor=3, timeout=60):
     session = requests.Session()
     retries_config = Retry(total=retries, backoff_factor=backoff_factor, status_forcelist=[502, 503, 504])
     session.mount('http://', HTTPAdapter(max_retries=retries_config))
     try:
+        start_time = time.time()
         response = session.post(url, data=data, timeout=timeout)
         response.raise_for_status()
-        print(f"[INFO] Successfully sent request to {url}")
+        logging.info(f"Sent request to {url}, response time: {time.time() - start_time:.2f}s")
         return response
     except requests.exceptions.RequestException as e:
-        print(f"[ERROR] Failed to send request to {url}: {str(e)}")
+        logging.error(f"Failed to send request to {url}: {str(e)}")
         return None
 
-# Log all incoming requests
+# Check ESP32 status
+def is_esp32_online(ip):
+    device = devices_collection.find_one({"ip": ip})
+    if not device:
+        return False
+    last_seen = device.get('last_seen')
+    if not last_seen:
+        return False
+    time_diff = (datetime.now() - last_seen).total_seconds()
+    return time_diff < 60
+
 @app.before_request
 def log_request():
-    print(f"[DEBUG] Incoming request: {request.method} {request.path}")
-
-@app.route('/register_ip', methods=['POST'])
-def register_ip():
-    global ESP32_CURRENT_IP
-    data = request.json
-    new_ip = data.get('ip', ESP32_CURRENT_IP)
-    if new_ip != ESP32_CURRENT_IP:
-        ESP32_CURRENT_IP = new_ip
-        print(f"[INFO] Updated ESP32 IP to {ESP32_CURRENT_IP}")
-    return jsonify({"status": "success"})
+    logging.debug(f"Request: {request.method} {request.path}, payload: {request.get_data(as_text=True)}")
 
 @app.route('/')
 @app.route('/camera')
 def camera():
     error_message = None
     try:
-        response = send_request_to_esp32(
-            f"http://{ESP32_CURRENT_IP}:81/set_mode",
-            data={'mode': 'stream'},
-            retries=5,
-            backoff_factor=2,
-            timeout=15
-        )
-        if response:
-            print("[INFO] Sent stream mode request to ESP32")
+        device = devices_collection.find_one({"mac": "F8:B3:B7:7B:32:A8"})
+        esp32_ip = device.get('ip', '192.168.0.101') if device else '192.168.0.101'
+        if not is_esp32_online(esp32_ip):
+            error_message = "Camera is offline. Please check the device."
         else:
-            error_message = "Không thể kết nối với camera. Vui lòng kiểm tra mạng hoặc thiết bị."
+            response = send_request_to_esp32(
+                f"http://{esp32_ip}:81/set_mode",
+                data={'mode': 'stream'},
+                retries=15,
+                backoff_factor=3,
+                timeout=60
+            )
+            if response:
+                logging.info("Set ESP32 to stream mode")
+            else:
+                error_message = "Failed to connect to camera."
     except Exception as e:
-        print(f"[ERROR] Failed to send stream mode request: {str(e)}")
-        error_message = "Không thể kết nối với camera. Vui lòng kiểm tra mạng hoặc thiết bị."
+        logging.error(f"Error setting stream mode: {str(e)}")
+        error_message = "Failed to connect to camera."
     return render_template('camera.html', error=error_message)
 
 @app.route('/messenger')
 def messenger():
     error_message = None
     try:
-        response = send_request_to_esp32(
-            f"http://{ESP32_CURRENT_IP}:81/set_mode",
-            data={'mode': 'detection'},
-            retries=5,
-            backoff_factor=2,
-            timeout=15
-        )
-        if response:
-            print("[INFO] Sent detection mode request to ESP32")
+        device = devices_collection.find_one({"mac": "F8:B3:B7:7B:32:A8"})
+        esp32_ip = device.get('ip', '192.168.0.101') if device else '192.168.0.101'
+        if not is_esp32_online(esp32_ip):
+            error_message = "Camera is offline. Please check the device."
         else:
-            error_message = "Không thể chuyển ESP32 sang chế độ phát hiện. Vui lòng kiểm tra mạng hoặc thiết bị."
+            # Kiểm tra trạng thái trước khi gửi yêu cầu
+            ping_response = send_request_to_esp32(
+                f"http://{esp32_ip}:81/set_mode",
+                data={'mode': 'ping'},
+                timeout=5
+            )
+            if not ping_response:
+                error_message = "ESP32 is not responding. Please wait and try again."
+            else:
+                response = send_request_to_esp32(
+                    f"http://{esp32_ip}:81/set_mode",
+                    data={'mode': 'detection'},
+                    retries=15,
+                    backoff_factor=3,
+                    timeout=60
+                )
+                if response:
+                    logging.info("Set ESP32 to detection mode")
+                else:
+                    error_message = "Failed to set detection mode."
     except Exception as e:
-        print(f"[ERROR] Failed to send detection mode request: {str(e)}")
-        error_message = "Không thể chuyển ESP32 sang chế độ phát hiện. Vui lòng kiểm tra mạng hoặc thiết bị."
+        logging.error(f"Error setting detection mode: {str(e)}")
+        error_message = "Failed to set detection mode."
     return render_template('messenger.html', error=error_message)
 
 @app.route('/history')
@@ -171,8 +161,8 @@ def get_history():
         results = list(history_collection.find({}, {"_id": 0}))
         return jsonify(results)
     except Exception as e:
-        print(f"[ERROR] Lỗi khi lấy lịch sử: {str(e)}")
-        return jsonify({"error": f"Không thể lấy lịch sử: {str(e)}"}), 500
+        logging.error(f"Error fetching history: {str(e)}")
+        return jsonify({"error": f"Failed to fetch history: {str(e)}"}), 500
 
 @app.route('/api/set_mode', methods=['POST'])
 def set_mode():
@@ -180,59 +170,72 @@ def set_mode():
         mode = request.form.get('mode')
         if mode not in ['stream', 'detection']:
             return jsonify({'error': 'Invalid mode'}), 400
+        device = devices_collection.find_one({"mac": "F8:B3:B7:7B:32:A8"})
+        esp32_ip = device.get('ip', '192.168.0.101') if device else '192.168.0.101'
+        if not is_esp32_online(esp32_ip):
+            return jsonify({'status': 'error', 'message': 'Camera is offline.'}), 500
         response = send_request_to_esp32(
-            f"http://{ESP32_CURRENT_IP}:81/set_mode",
+            f"http://{esp32_ip}:81/set_mode",
             data={'mode': mode},
-            retries=5,
-            backoff_factor=2,
-            timeout=15
+            retries=15,
+            backoff_factor=3,
+            timeout=60
         )
         if response:
-            print(f"[INFO] Successfully set ESP32 to {mode} mode")
+            logging.info(f"Set ESP32 to {mode} mode")
             return jsonify({'status': 'success', 'mode': mode})
-        return jsonify({
-            'status': 'error',
-            'message': 'Không thể kết nối với ESP32. Vui lòng kiểm tra mạng hoặc thiết bị.'
-        }), 500
+        return jsonify({'status': 'error', 'message': 'Failed to connect to ESP32.'}), 500
     except Exception as e:
-        print(f"[ERROR] Error setting mode: {str(e)}")
-        return jsonify({
-            'status': 'error',
-            'message': f'Không thể kết nối với ESP32: {str(e)}'
-        }), 500
+        logging.error(f"Error setting mode: {str(e)}")
+        return jsonify({'status': 'error', 'message': f'Failed to connect to ESP32: {str(e)}'}), 500
 
 @app.route('/api/ping_esp32', methods=['GET'])
 def ping_esp32():
     try:
+        device = devices_collection.find_one({"mac": "F8:B3:B7:7B:32:A8"})
+        esp32_ip = device.get('ip', '192.168.0.101') if device else '192.168.0.101'
+        if not is_esp32_online(esp32_ip):
+            return jsonify({"status": "offline"}), 500
         response = send_request_to_esp32(
-            f"http://{ESP32_CURRENT_IP}:81/set_mode",
+            f"http://{esp32_ip}:81/set_mode",
             data={'mode': 'ping'},
             timeout=5
         )
-        if response:
-            return jsonify({"status": "online"})
-        return jsonify({"status": "offline"}), 500
+        return jsonify({"status": "online" if response else "offline"})
     except Exception as e:
-        print(f"[ERROR] Ping ESP32 failed: {str(e)}")
+        logging.error(f"Ping ESP32 failed: {str(e)}")
         return jsonify({"status": "offline"}), 500
+
+@app.route('/api/report_ip', methods=['POST'])
+def report_ip():
+    try:
+        data = request.get_json()
+        ip = data.get('ip')
+        mac = data.get('mac')
+        logging.info(f"Updated ESP32 IP to {ip} (MAC: {mac})")
+        devices_collection.update_one(
+            {"mac": mac},
+            {"$set": {"ip": ip, "last_seen": datetime.now()}},
+            upsert=True
+        )
+        return jsonify({"status": "success", "ip": ip})
+    except Exception as e:
+        logging.error(f"Failed to update IP: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 400
 
 @app.route('/fall_detect', methods=['POST'])
 def fall_detect():
     try:
-        print(f"[DEBUG] Received POST request to /fall_detect, data size: {len(request.data)} bytes")
-        print(f"[DEBUG] Headers: {dict(request.headers)}")
+        logging.debug(f"Received /fall_detect, data size: {len(request.data)} bytes")
         if request.headers.get('X-API-Key') != API_KEY:
-            print("[ERROR] Invalid API key")
-            return jsonify({'fall': False, 'error': "Khóa API không hợp lệ"}), 401
+            return jsonify({'fall': False, 'error': "Invalid API key"}), 401
 
         if not request.data:
-            print("[ERROR] No image data received")
-            return jsonify({'fall': False, 'error': "Không nhận được dữ liệu ảnh"}), 400
+            return jsonify({'fall': False, 'error': "No image data received"}), 400
 
         raw = np.frombuffer(request.data, dtype=np.uint8)
         if raw.size < 96 * 96:
-            print(f"[ERROR] Data size too small: {raw.size} bytes, expected: {96 * 96} bytes")
-            return jsonify({'fall': False, 'error': f"Kích thước dữ liệu quá nhỏ: {raw.size} bytes"}), 400
+            return jsonify({'fall': False, 'error': f"Data size too small: {raw.size} bytes"}), 400
         raw = raw[:96 * 96]
 
         image = raw ^ 0x80
@@ -244,7 +247,6 @@ def fall_detect():
         fall_score = output_data.item() if output_data.size == 1 else output_data[1]
 
         if fall_score > 1.0 or fall_score < 0.0:
-            print(f"[WARNING] Invalid fall_score: {fall_score}, clamping to 0-1 range")
             fall_score = max(0.0, min(1.0, fall_score))
 
         status = "Ngã" if fall_score > 0.7 else "Bình thường"
@@ -264,14 +266,14 @@ def fall_detect():
             "probability": f"{fall_score * 100:.0f}%",
             "image_path": image_url
         }
-        result = history_collection.insert_one(entry)
+        history_collection.insert_one(entry)
 
         socketio.emit('new_detection', entry)
-        print(f"[DEBUG] Detection result: fall={fall_score > 0.7}, score={fall_score}, saved to {filepath}")
+        logging.info(f"Detection: fall={fall_score > 0.7}, score={fall_score}")
         return jsonify({"fall": fall_score > 0.7, "score": float(fall_score)})
 
     except Exception as e:
-        print(f"[ERROR] Lỗi khi xử lý ảnh: {str(e)}")
+        logging.error(f"Error processing image: {str(e)}")
         return jsonify({'fall': False, 'error': str(e)}), 500
 
 @app.route('/stream')
@@ -279,53 +281,43 @@ def stream():
     global active_streams
     try:
         if active_streams >= MAX_STREAM_CLIENTS:
-            print("[ERROR] Maximum stream clients reached")
-            return "<p>Lỗi: Đã đạt số lượng client tối đa</p>", 429
+            return "<p>Error: Maximum clients reached</p>", 429
 
         active_streams += 1
         def proxy_stream():
             global active_streams
             try:
-                url = f"http://{ESP32_CURRENT_IP}:81/stream"
-                print(f"[DEBUG] Starting stream proxy to {url}")
+                device = devices_collection.find_one({"mac": "F8:B3:B7:7B:32:A8"})
+                esp32_ip = device.get('ip', '192.168.0.101') if device else '192.168.0.101'
+                url = f"http://{esp32_ip}:81/stream"
                 while True:
+                    if not is_esp32_online(esp32_ip):
+                        break
                     try:
-                        req = requests.get(url, stream=True, timeout=30)
-                        print(f"[DEBUG] Stream connected, status: {req.status_code}")
+                        req = requests.get(url, stream=True, timeout=10)
                         for chunk in req.iter_content(chunk_size=1024):
                             if chunk:
                                 yield chunk
                     except requests.exceptions.RequestException as e:
-                        print(f"[WARNING] Stream disconnected: {str(e)}, attempting to reconnect...")
-                        time.sleep(2)
+                        time.sleep(3)
                         continue
             except Exception as e:
-                print(f"[ERROR] Stream proxy failed: {str(e)}")
-                active_streams -= 1
+                logging.error(f"Stream proxy failed: {str(e)}")
                 raise
             finally:
-                print("[DEBUG] Stream proxy closed")
                 active_streams -= 1
         return Response(proxy_stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
     except Exception as e:
-        print(f"[ERROR] Lỗi khi proxy stream: {str(e)}")
+        logging.error(f"Error proxying stream: {str(e)}")
         active_streams -= 1
-        return "<p>Lỗi: Không thể kết nối camera</p>", 500
+        return "<p>Error: Failed to connect to camera</p>", 500
 
 @app.route('/static/audio/<filename>')
 def serve_audio(filename):
     try:
         return send_from_directory('static/audio', filename)
     except FileNotFoundError:
-        print(f"[WARNING] Audio file {filename} not found")
         return jsonify({'status': 'error', 'message': 'Audio file not found'}), 404
 
 if __name__ == '__main__':
-    try:
-        socketio.run(app, host='0.0.0.0', port=5000, debug=True)
-    finally:
-        # Dọn dẹp mDNS khi dừng server
-        zeroconf_instance.unregister_service(zeroconf_service)
-        zeroconf_instance.close()
-
-
+    socketio.run(app, host='0.0.0.0', port=5000, debug=False)

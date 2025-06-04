@@ -1,17 +1,25 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include <ESPmDNS.h>
 #include "esp_camera.h"
 #include <WiFiClient.h>
 #include <WebServer.h>
+#include "esp_heap_caps.h"
+#include "esp_system.h"
 
-// WiFi và server
-const char* ssid = "F4G";
-const char* password = "12345679";
-const char* server_name = "flask-server.local"; // Sử dụng mDNS
-const char* api_key = "08112003";              // Khóa API
-WebServer stream_server(81);                    // Server MJPEG trên cổng 81
-String server_url = "http://" + String(server_name) + ":5000/fall_detect";
+// WiFi and server
+const char* ssid = "Nguyễn Hữu Dũng";
+const char* password = "nguyenhuudung2003";
+const char* server_url = "http://192.168.0.100:5000/fall_detect";
+const char* report_ip_url = "http://192.168.0.100:5000/api/report_ip";
+const char* api_key = "08112003";
+WebServer stream_server(81);
+
+// Static IP configuration
+IPAddress local_IP(192, 168, 0, 101);
+IPAddress gateway(192, 168, 0, 1);
+IPAddress subnet(255, 255, 255, 0);
+IPAddress primaryDNS(8, 8, 8, 8);
+IPAddress secondaryDNS(8, 8, 4, 4);
 
 // TensorFlow Lite
 #include "TensorFlowLite_ESP32.h"
@@ -28,24 +36,27 @@ const tflite::Model* model = nullptr;
 tflite::MicroInterpreter* interpreter = nullptr;
 TfLiteTensor* input = nullptr;
 
-constexpr int kTensorArenaSize = 100 * 1024; // 100KB cho tensor arena
+constexpr int kTensorArenaSize = 100 * 1024;
 static uint8_t* tensor_arena = nullptr;
+bool tflite_initialized = false;
 
 // Model settings
 float latest_person_score = 0.0;
 bool fall_detected = false;
-bool streaming_active = false;
-String device_mode = "detection"; // Chế độ mặc định là detection
+bool streaming_active = true;
+String device_mode = "stream";
 bool camera_initialized = false;
 unsigned long last_detection_time = 0;
-const unsigned long DETECTION_INTERVAL = 1000; // Kiểm tra mỗi 1 giây
-  
+const unsigned long DETECTION_INTERVAL = 2000;
+unsigned long last_ip_report_time = 0;
+const unsigned long IP_REPORT_INTERVAL = 10000;
+
 // === CAMERA FUNCTIONS ===
-bool initCamera(bool for_streaming = false) {
+bool initCamera(bool for_streaming = true) {
   if (camera_initialized) {
     esp_camera_deinit();
     camera_initialized = false;
-    delay(100);
+    delay(200);
   }
 
   camera_config_t config;
@@ -67,50 +78,47 @@ bool initCamera(bool for_streaming = false) {
   config.pin_sscb_scl = 27;
   config.pin_pwdn = 32;
   config.pin_reset = -1;
-  config.xclk_freq_hz = 20000000;
+  config.xclk_freq_hz = 10000000;
   config.fb_location = CAMERA_FB_IN_PSRAM;
+  config.fb_count = 1;
 
   if (for_streaming) {
     config.pixel_format = PIXFORMAT_JPEG;
-    config.frame_size = FRAMESIZE_QQVGA; // Sử dụng FRAMESIZE_QQVGA (160x120)
-    config.jpeg_quality = 10;            // Giảm chất lượng để tối ưu
-    config.fb_count = 1;
+    config.frame_size = FRAMESIZE_QQVGA;
+    config.jpeg_quality = 30;
   } else {
     config.pixel_format = PIXFORMAT_GRAYSCALE;
     config.frame_size = FRAMESIZE_96X96;
-    config.fb_count = 1;
   }
 
-  Serial.println("🔧 Initializing camera...");
-  int retry_count = 0;
-  const int max_retries = 3;
-  esp_err_t err;
-  while (retry_count < max_retries) {
+  Serial.printf("🔍 Free PSRAM before camera init: %u bytes\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+  Serial.printf("🔍 Free heap before camera init: %u bytes\n", esp_get_free_heap_size());
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("❌ Camera init failed with error 0x%x, attempting recovery...\n", err);
+    config.fb_count = 1;
+    config.frame_size = for_streaming ? FRAMESIZE_QQVGA : FRAMESIZE_96X96;
     err = esp_camera_init(&config);
-    if (err == ESP_OK) {
-      Serial.println("✅ Camera initialized for " + String(for_streaming ? "streaming" : "detection"));
-      camera_initialized = true;
-      return true;
+    if (err != ESP_OK) {
+      Serial.printf("❌ Camera reinitialization failed with error 0x%x\n", err);
+      return false;
     }
-    Serial.printf("❌ Camera init failed with error 0x%x\n", err);
-    esp_camera_deinit();
-    delay(100);
-    retry_count++;
   }
-  Serial.println("❌ Camera init failed after retries.");
-  return false;
+  Serial.println("✅ Camera initialized for " + String(for_streaming ? "streaming" : "detection"));
+  camera_initialized = true;
+  Serial.printf("🔍 Free PSRAM after camera init: %u bytes\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+  return true;
 }
 
 camera_fb_t* captureGrayscaleFrame() {
-  if (!initCamera(false)) {
-    Serial.println("❌ Failed to initialize camera for grayscale capture");
+  if (!camera_initialized || !setCameraFormat(false)) {
+    Serial.println("❌ Camera not ready for grayscale capture");
     return nullptr;
   }
 
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) {
     Serial.println("❌ Failed to capture grayscale frame");
-    esp_camera_deinit();
     camera_initialized = false;
     return nullptr;
   }
@@ -118,29 +126,57 @@ camera_fb_t* captureGrayscaleFrame() {
   return fb;
 }
 
+bool setCameraFormat(bool for_streaming) {
+  sensor_t* s = esp_camera_sensor_get();
+  if (!s) {
+    Serial.println("❌ Failed to get camera sensor");
+    return false;
+  }
+
+  if (for_streaming) {
+    s->set_pixformat(s, PIXFORMAT_JPEG);
+    s->set_framesize(s, FRAMESIZE_QQVGA);
+    s->set_quality(s, 30);
+  } else {
+    s->set_pixformat(s, PIXFORMAT_GRAYSCALE);
+    s->set_framesize(s, FRAMESIZE_96X96);
+  }
+  delay(100);
+  return true;
+}
+
 // === MJPEG STREAMING ===
 void handleStream() {
   WiFiClient client = stream_server.client();
   if (!client) {
+    Serial.println("❌ No client connected for streaming");
     return;
   }
 
   if (!streaming_active) {
-    streaming_active = true;
-    if (!initCamera(true)) {
-      Serial.println("❌ Failed to initialize camera for streaming");
-      streaming_active = false;
-      client.stop();
-      return;
-    }
-    Serial.println("✅ Streaming started");
+    client.stop();
+    Serial.println("✅ Streaming stopped due to inactive state");
+    return;
   }
+
+  if (!camera_initialized || !setCameraFormat(true)) {
+    Serial.println("❌ Failed to prepare camera for streaming");
+    client.stop();
+    return;
+  }
+  Serial.println("✅ Streaming started");
 
   String response = "HTTP/1.1 200 OK\r\n";
   response += "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
-  client.write(response.c_str());
+  client.print(response);
 
+  unsigned long lastFrameTime = millis();
   while (client.connected() && streaming_active && device_mode == "stream") {
+    if (millis() - lastFrameTime < 50) {
+      continue; // Giới hạn frame rate
+    }
+    lastFrameTime = millis();
+
     camera_fb_t* fb = esp_camera_fb_get();
     if (!fb) {
       Serial.println("❌ Camera capture failed for stream");
@@ -152,44 +188,91 @@ void handleStream() {
     client.write(fb->buf, fb->len);
     client.write("\r\n", 2);
     esp_camera_fb_return(fb);
-    delay(30);
+
+    // Kiểm tra client còn kết nối không
+    if (!client.connected()) {
+      Serial.println("❌ Client disconnected during streaming");
+      break;
+    }
   }
 
   streaming_active = false;
   client.stop();
   Serial.println("✅ Streaming stopped");
-  if (device_mode == "detection") {
-    initCamera(false);
-  }
 }
 
-// === XỬ LÝ CHẾ ĐỘ ===
+// === MODE HANDLING ===
 void handleSetMode() {
   Serial.println("📡 Received /set_mode request");
-  String mode = stream_server.arg("mode");
-  if (mode == "stream" || mode == "detection") {
-    device_mode = mode;
-    Serial.println("✅ Set device mode to: " + device_mode);
+  if (!stream_server.hasArg("mode")) {
+    Serial.println("❌ No mode argument provided");
+    stream_server.send(400, "application/json", "{\"error\":\"No mode provided\"}");
+    return;
+  }
 
-    if (device_mode == "stream") {
-      if (!streaming_active) {
-        streaming_active = true;
-        initCamera(true);
-      }
-    } else if (device_mode == "detection") {
+  String mode = stream_server.arg("mode");
+  Serial.println("🔍 Received mode: " + mode);
+
+  if (mode == "stream" || mode == "detection") {
+    if (device_mode != mode) {
+      Serial.println("🔄 Changing mode from " + device_mode + " to " + mode);
       streaming_active = false;
-      initCamera(false);
+
+      // Đợi streaming dừng hoàn toàn
+      unsigned long stopTimeout = millis();
+      while (millis() - stopTimeout < 2000) {
+        if (!streaming_active) break;
+        delay(10);
+      }
+      Serial.println("✅ Streaming fully stopped");
+
+      // Giải phóng tài nguyên camera
+      if (camera_initialized) {
+        esp_camera_deinit();
+        camera_initialized = false;
+        Serial.println("✅ Camera deinitialized to free memory");
+        delay(200);
+      }
+
+      device_mode = mode;
+      Serial.println("✅ Set device mode to: " + device_mode);
+      streaming_active = (device_mode == "stream");
+
+      if (device_mode == "stream") {
+        if (!initCamera(true)) {
+          Serial.println("❌ Failed to prepare camera for streaming");
+          streaming_active = false;
+          device_mode = "detection";
+        }
+      } else if (device_mode == "detection") {
+        streaming_active = false;
+        if (!initCamera(false)) {
+          Serial.println("❌ Failed to prepare camera for detection");
+          device_mode = "stream";
+        }
+        if (!tflite_initialized && !initTensorFlow()) {
+          Serial.println("❌ TensorFlow reinitialization failed");
+        }
+      }
+    } else {
+      Serial.println("🔄 Mode unchanged: " + device_mode);
     }
     stream_server.send(200, "application/json", "{\"status\":\"success\",\"mode\":\"" + mode + "\"}");
   } else {
+    Serial.println("❌ Invalid mode received");
     stream_server.send(400, "application/json", "{\"error\":\"Invalid mode\"}");
   }
 }
 
-// === MÔ HÌNH PHÁT HIỆN NGƯỜI ===
+// === PERSON DETECTION ===
 void runPersonDetection(camera_fb_t* fb) {
+  if (!tflite_initialized) {
+    Serial.println("❌ TensorFlow Lite not initialized, skipping detection");
+    return;
+  }
+
   if (!fb || fb->width != kNumCols || fb->height != kNumRows) {
-    Serial.printf("❌ Invalid frame buffer. Got: %dx%d, expected: %dx%d\n", fb->width, fb->height, kNumCols, kNumRows);
+    Serial.printf("❌ Invalid frame: %dx%d, expected: %dx%d\n", fb->width, fb->height, kNumCols, kNumRows);
     return;
   }
 
@@ -197,16 +280,9 @@ void runPersonDetection(camera_fb_t* fb) {
     input->data.int8[i] = static_cast<int8_t>(fb->buf[i] - 128);
   }
 
-  Serial.println("🔍 Input data sample:");
-  for (int i = 0; i < 10; i++) {
-    Serial.printf("%d ", input->data.int8[i]);
-  }
-  Serial.println();
-
   TfLiteStatus invoke_status = interpreter->Invoke();
   if (invoke_status != kTfLiteOk) {
-    error_reporter->Report("❌ Model inference failed with status: %d", invoke_status);
-    Serial.println("❌ Model inference failed");
+    error_reporter->Report("❌ Inference failed: %d", invoke_status);
     return;
   }
 
@@ -215,127 +291,25 @@ void runPersonDetection(camera_fb_t* fb) {
   int8_t no_person_score = output->data.int8[kNotAPersonIndex];
 
   latest_person_score = (person_score + 128) / 255.0;
-  float no_person_score_float = (no_person_score + 128) / 255.0;
-
-  Serial.printf("🔍 Person score: %.2f, No person score: %.2f\n", latest_person_score, no_person_score_float);
+  Serial.printf("🔍 Person score: %.2f\n", latest_person_score);
 }
 
-// === GỬI ẢNH VỀ SERVER ===
-bool sendImageToServer(camera_fb_t* fb, String location = "Phòng Ngủ") {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("❌ WiFi disconnected, reconnecting...");
-    WiFi.reconnect();
-    unsigned long start_time = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start_time < 5000) {
-      delay(500);
-      Serial.print(".");
-    }
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("❌ Reconnect failed");
-      return false;
-    }
-    Serial.println("✅ WiFi reconnected");
-
-    // Đăng ký IP của ESP32 với server khi kết nối lại
-    HTTPClient http;
-    http.begin("http://" + String(server_name) + ":5000/register_ip");
-    http.addHeader("Content-Type", "application/json");
-    String payload = "{\"ip\":\"" + WiFi.localIP().toString() + "\"}";
-    http.POST(payload);
-    http.end();
-  }
-
-  HTTPClient http;
-  http.setTimeout(15000); // Increase timeout to 15 seconds
-  http.begin(server_url);
-  http.addHeader("Content-Type", "application/octet-stream");
-  http.addHeader("X-Location", location);
-  http.addHeader("X-API-Key", api_key);
-
-  Serial.println("📤 Sending image to server...");
-  int httpCode = http.POST(fb->buf, fb->len);
-  bool fall = false;
-  if (httpCode > 0) {
-    if (httpCode == HTTP_CODE_OK) {
-      String res = http.getString();
-      Serial.println("📤 Server response: " + res);
-      fall = res.indexOf("\"fall\":true") >= 0;
-      Serial.println(fall ? "🔴 Fall detected by server!" : "✅ No fall detected by server");
-    } else {
-      Serial.printf("❌ HTTP POST failed, code: %d\n", httpCode);
-    }
-  } else {
-    Serial.printf("❌ HTTP POST failed, error: %s\n", http.errorToString(httpCode).c_str());
-  }
-  http.end();
-  return fall;
-}
-
-// === KIỂM TRA KẾT NỐI WIFI ===
-void checkWiFi() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("❌ WiFi disconnected, reconnecting...");
-    WiFi.reconnect();
-    unsigned long start_time = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start_time < 5000) {
-      delay(500);
-      Serial.print(".");
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("✅ WiFi reconnected: " + WiFi.localIP().toString());
-    } else {
-      Serial.println("❌ Reconnect failed");
-    }
-  }
-}
-
-// === SETUP ===
-void setup() {
-  Serial.begin(115200);
-  pinMode(4, OUTPUT);
-  digitalWrite(4, LOW);
-
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi...");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\n✅ WiFi connected: " + WiFi.localIP().toString());
-
-  // Khởi động mDNS cho ESP32
-  if (!MDNS.begin("esp32-cam")) {
-    Serial.println("❌ Error starting mDNS");
-  } else {
-    Serial.println("✅ mDNS responder started: esp32-cam.local");
-  }
-
-  // Đăng ký IP của ESP32 với server khi khởi động
-  HTTPClient http;
-  http.begin("http://" + String(server_name) + ":5000/register_ip");
-  http.addHeader("Content-Type", "application/json");
-  String payload = "{\"ip\":\"" + WiFi.localIP().toString() + "\"}";
-  http.POST(payload);
-  http.end();
-
-  if (!initCamera(false)) {
-    Serial.println("❌ Camera init failed, halting...");
-    while (1);
-  }
+// === INIT TENSORFLOW ===
+bool initTensorFlow() {
+  if (tflite_initialized) return true;
 
   static tflite::MicroErrorReporter micro_error_reporter;
-  error_reporter = &micro_error_reporter; // Sửa lỗi cú pháp
+  error_reporter = &micro_error_reporter;
   model = tflite::GetModel(g_person_detect_model_data);
   if (model->version() != TFLITE_SCHEMA_VERSION) {
-    error_reporter->Report("❌ Model version mismatch: model version %d, expected %d", 
-                           model->version(), TFLITE_SCHEMA_VERSION);
-    while (1);
+    error_reporter->Report("❌ Model version mismatch");
+    return false;
   }
 
   tensor_arena = (uint8_t*)heap_caps_malloc(kTensorArenaSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!tensor_arena) {
     Serial.println("❌ Tensor arena allocation failed");
-    while (1);
+    return false;
   }
 
   static tflite::MicroMutableOpResolver<6> resolver;
@@ -351,23 +325,145 @@ void setup() {
 
   TfLiteStatus allocate_status = interpreter->AllocateTensors();
   if (allocate_status != kTfLiteOk) {
-    error_reporter->Report("❌ Tensor allocation failed with status: %d", allocate_status);
+    error_reporter->Report("❌ Tensor allocation failed, required: %d, available: %d",
+                           interpreter->arena_used_bytes(), kTensorArenaSize);
+    heap_caps_free(tensor_arena);
+    tensor_arena = nullptr;
+    return false;
+  }
+
+  input = interpreter->input(0);
+  tflite_initialized = true;
+  Serial.println("✅ TensorFlow Lite initialized");
+  return true;
+}
+
+// === REPORT IP ===
+void reportIPToServer() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("❌ WiFi not connected, skipping IP report");
+    return;
+  }
+
+  HTTPClient http;
+  http.setTimeout(15000);
+  http.setConnectTimeout(5000);
+  if (!http.begin(report_ip_url)) {
+    Serial.println("❌ Failed to initialize HTTP client");
+    return;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  String payload = "{\"ip\":\"" + WiFi.localIP().toString() + "\", \"mac\":\"" + WiFi.macAddress() + "\"}";
+  Serial.println("📤 Reporting IP: " + payload);
+
+  int httpCode = http.POST(payload);
+  if (httpCode == HTTP_CODE_OK) {
+    Serial.println("✅ Reported IP to server");
+  } else {
+    Serial.printf("❌ HTTP POST failed, code: %d\n", httpCode);
+  }
+
+  http.end();
+  delay(100);
+}
+
+// === SEND IMAGE ===
+bool sendImageToServer(camera_fb_t* fb, String location = "Phòng Ngủ") {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("❌ WiFi disconnected, reconnecting...");
+    WiFi.reconnect();
+    delay(5000);
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("❌ Reconnect failed");
+      return false;
+    }
+    Serial.println("✅ WiFi reconnected");
+    reportIPToServer();
+  }
+
+  HTTPClient http;
+  http.setTimeout(20000);
+  http.setConnectTimeout(5000);
+  if (!http.begin(server_url)) {
+    Serial.println("❌ Failed to initialize HTTP client");
+    return false;
+  }
+
+  http.addHeader("Content-Type", "application/octet-stream");
+  http.addHeader("X-Location", location);
+  http.addHeader("X-API-Key", api_key);
+
+  Serial.println("📤 Sending image...");
+  int httpCode = http.POST(fb->buf, fb->len);
+  bool fall = false;
+  if (httpCode == HTTP_CODE_OK) {
+    String res = http.getString();
+    Serial.println("📤 Server response: " + res);
+    fall = res.indexOf("\"fall\":true") >= 0;
+    Serial.println(fall ? "🔴 Fall detected!" : "✅ No fall detected");
+  } else {
+    Serial.printf("❌ HTTP POST failed, code: %d\n", httpCode);
+  }
+  http.end();
+  return fall;
+}
+
+// === CHECK WIFI ===
+void checkWiFi() {
+  static unsigned long last_check = 0;
+  const unsigned long CHECK_INTERVAL = 10000;
+
+  if (millis() - last_check < CHECK_INTERVAL) return;
+  last_check = millis();
+
+  Serial.printf("🔍 WiFi RSSI: %ld dBm\n", WiFi.RSSI());
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("❌ WiFi disconnected, reconnecting...");
+    WiFi.reconnect();
+    delay(5000);
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("✅ WiFi reconnected: " + WiFi.localIP().toString());
+      reportIPToServer();
+    } else {
+      Serial.println("❌ Reconnect failed");
+    }
+  }
+}
+
+// === SETUP ===
+void setup() {
+  Serial.begin(115200);
+  pinMode(4, OUTPUT);
+  digitalWrite(4, LOW);
+
+  if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
+    Serial.println("❌ Failed to configure static IP");
+  }
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi...");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n✅ WiFi connected: " + WiFi.localIP().toString());
+  reportIPToServer();
+
+  if (!initCamera(true)) {
+    Serial.println("❌ Camera init failed, halting...");
     while (1);
   }
-  input = interpreter->input(0);
 
-  Serial.printf("📦 Input tensor type: %d\n", input->type);
-  TfLiteTensor* output = interpreter->output(0);
-  Serial.printf("📦 Output tensor type: %d\n", output->type);
-  Serial.printf("🔍 Input tensor dims: %d x %d x %d\n", 
-                input->dims->data[1], input->dims->data[2], input->dims->data[3]);
+  if (!initTensorFlow()) {
+    Serial.println("❌ TensorFlow initialization failed, halting...");
+    while (1);
+  }
 
   stream_server.on("/stream", handleStream);
   stream_server.on("/set_mode", handleSetMode);
   stream_server.begin();
   Serial.println("✅ MJPEG stream server started on port 81");
-
-  Serial.println("✅ ESP32-CAM initialized");
 }
 
 // === LOOP ===
@@ -375,9 +471,9 @@ void loop() {
   checkWiFi();
   stream_server.handleClient();
 
-  if (device_mode == "detection" && !streaming_active) {
-    if (!camera_initialized) {
-      Serial.println("❌ Camera not initialized, attempting to reinitialize...");
+  if (device_mode == "detection" && !streaming_active && tflite_initialized) {
+    if (!camera_initialized || !initCamera(false)) {
+      Serial.println("❌ Camera not ready, attempting reinitialization...");
       if (!initCamera(false)) {
         Serial.println("❌ Reinitialization failed");
         delay(2000);
@@ -396,24 +492,22 @@ void loop() {
       }
 
       runPersonDetection(fb);
+      esp_camera_fb_return(fb);
 
       if (latest_person_score > 0.7) {
         Serial.println("👤 Person detected, sending to server...");
         camera_fb_t* fb_grayscale = captureGrayscaleFrame();
         if (fb_grayscale) {
           fall_detected = sendImageToServer(fb_grayscale, "Phòng Ngủ");
+          esp_camera_fb_return(fb_grayscale);
           digitalWrite(4, fall_detected ? HIGH : LOW);
           Serial.println(fall_detected ? "🔴 Fall detected!" : "✅ No fall detected");
-          esp_camera_fb_return(fb_grayscale);
-        } else {
-          Serial.println("❌ Failed to capture grayscale image for sending");
         }
       } else {
         fall_detected = false;
         digitalWrite(4, LOW);
       }
 
-      esp_camera_fb_return(fb);
       last_detection_time = current_time;
     }
   }

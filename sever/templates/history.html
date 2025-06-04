@@ -11,7 +11,11 @@
         <ul id="historyList" class="space-y-4 hidden"></ul>
     </div>
 </main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js" async></script>
 <script>
+    const socket = io('http://' + window.location.host);
+    let historyData = [];
+
     async function loadHistory() {
         const list = document.getElementById('historyList');
         const loading = document.getElementById('loading');
@@ -20,9 +24,10 @@
             if (!res.ok) throw new Error('Lỗi khi lấy dữ liệu: ' + res.status);
             const data = await res.json();
             if (data.error) throw new Error(data.error);
+            historyData = data;
             loading.classList.add('hidden');
             list.classList.remove('hidden');
-            displayHistory(data);
+            displayHistory(historyData);
         } catch (error) {
             console.error('Lỗi:', error);
             list.innerHTML = '<li class="bg-red-50 p-4 rounded-lg shadow text-red-600">Lỗi: Không thể tải lịch sử</li>';
@@ -61,21 +66,24 @@
         });
     }
 
-    document.getElementById('searchInput').addEventListener('input', async (e) => {
-        try {
-            const res = await fetch('/api/history');
-            if (!res.ok) throw new Error('Lỗi khi lấy dữ liệu: ' + res.status);
-            const data = await res.json();
-            if (data.error) throw new Error(data.error);
-            const keyword = e.target.value.toLowerCase();
-            const filtered = data.filter(entry =>
-                (entry.timestamp || '').toLowerCase().includes(keyword) ||
-                (entry.location || '').toLowerCase().includes(keyword) ||
-                (entry.status || '').toLowerCase().includes(keyword)
-            );
-            displayHistory(filtered);
-        } catch (error) {
-            console.error('Lỗi:', error);
+    document.getElementById('searchInput').addEventListener('input', (e) => {
+        const keyword = e.target.value.toLowerCase();
+        const filtered = historyData.filter(entry =>
+            (entry.timestamp || '').toLowerCase().includes(keyword) ||
+            (entry.location || '').toLowerCase().includes(keyword) ||
+            (entry.status || '').toLowerCase().includes(keyword)
+        );
+        displayHistory(filtered);
+    });
+
+    socket.on('new_detection', (data) => {
+        historyData.unshift(data);
+        const searchInput = document.getElementById('searchInput').value.toLowerCase();
+        if (!searchInput ||
+            data.timestamp.toLowerCase().includes(searchInput) ||
+            data.location.toLowerCase().includes(searchInput) ||
+            data.status.toLowerCase().includes(searchInput)) {
+            displayHistory(historyData);
         }
     });
 

@@ -6,6 +6,9 @@
         <h2 class="text-2xl font-semibold mb-4 text-gray-800 flex items-center gap-2">
             <span>🎥</span> Camera trực tiếp
         </h2>
+        <div id="modeMessage" class="bg-blue-50 p-4 rounded-lg shadow text-blue-600 mb-4">
+            Bạn đang ở chế độ <strong>stream</strong>. Nhấn vào "Thông báo" để chuyển sang chế độ phát hiện.
+        </div>
         <div class="camera-container bg-white rounded-xl shadow-md p-4">
             <div class="aspect-video rounded-lg overflow-hidden border border-gray-200">
                 <img id="streamImage" src="/stream" alt="Live Camera" class="w-full h-full object-cover"
@@ -16,36 +19,65 @@
                 onclick="reconnectStream()">Thử lại</button>
         </div>
     </div>
+    <div id="loadingSpinner" class="fixed inset-0 flex items-center justify-center bg-gray-800 bg-opacity-50 hidden">
+        <div class="text-white text-lg">Đang tải...</div>
+    </div>
 </main>
 <script>
     // Gửi yêu cầu chuyển sang chế độ stream khi tải trang
-    fetch('/api/set_mode', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body: 'mode=stream'
-    })
-        .then(response => response.json())
-        .then(data => {
-            if (data.status === 'success') {
-                console.log('ESP32 set to stream mode');
-            } else {
-                console.error('Failed to set stream mode:', data.error);
-            }
-        })
-        .catch(error => console.error('Error setting stream mode:', error));
-
     const streamImage = document.getElementById('streamImage');
     const streamStatus = document.getElementById('streamStatus');
     const reconnectBtn = document.getElementById('reconnectBtn');
+    const loadingSpinner = document.getElementById('loadingSpinner');
+    const modeMessage = document.getElementById('modeMessage');
+
+    function showSpinner() {
+        loadingSpinner.classList.remove('hidden');
+    }
+
+    function hideSpinner() {
+        loadingSpinner.classList.add('hidden');
+    }
+
+    async function setStreamMode() {
+        showSpinner();
+        try {
+            const response = await fetch('/api/set_mode', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: 'mode=stream'
+            });
+            const data = await response.json();
+            if (data.status === 'success') {
+                console.log('ESP32 set to stream mode');
+                streamImage.src = '/stream?' + new Date().getTime();
+                modeMessage.textContent = 'Bạn đang ở chế độ stream. Nhấn vào "Thông báo" để chuyển sang chế độ phát hiện.';
+                modeMessage.classList.remove('text-red-600', 'bg-red-50');
+                modeMessage.classList.add('text-blue-600', 'bg-blue-50');
+            } else {
+                console.error('Failed to set stream mode:', data.message);
+                modeMessage.textContent = 'Lỗi: ' + data.message;
+                modeMessage.classList.remove('text-blue-600', 'bg-blue-50');
+                modeMessage.classList.add('text-red-600', 'bg-red-50');
+                reconnectBtn.classList.remove('hidden');
+            }
+        } catch (error) {
+            console.error('Error setting stream mode:', error);
+            modeMessage.textContent = 'Lỗi: Không thể kết nối với ESP32';
+            modeMessage.classList.remove('text-blue-600', 'bg-blue-50');
+            modeMessage.classList.add('text-red-600', 'bg-red-50');
+            reconnectBtn.classList.remove('hidden');
+        } finally {
+            hideSpinner();
+        }
+    }
 
     function reconnectStream() {
         streamStatus.textContent = 'Đang thử lại...';
         streamStatus.classList.remove('text-green-600', 'text-red-600');
         streamStatus.classList.add('text-gray-600');
         reconnectBtn.classList.add('hidden');
-        streamImage.src = '/stream?' + new Date().getTime(); // Tải lại stream
+        setStreamMode();
     }
 
     streamImage.onload = () => {
@@ -61,5 +93,8 @@
         streamStatus.classList.add('text-red-600');
         reconnectBtn.classList.remove('hidden');
     };
+
+    // Gọi khi tải trang
+    setStreamMode();
 </script>
 {% endblock %}
